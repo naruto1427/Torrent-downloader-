@@ -7,10 +7,8 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from pymongo import MongoClient
 
-# Load env
 load_dotenv()
 
-# === ENV VARIABLES ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
@@ -26,7 +24,6 @@ mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["torrentbot"]
 admin_collection = db["admins"]
 
-# Sync admins from env
 existing = admin_collection.find_one({"_id": "admins"})
 if not existing:
     admin_collection.insert_one({"_id": "admins", "users": ADMINS})
@@ -41,7 +38,9 @@ def is_admin(user_id: int) -> bool:
     data = admin_collection.find_one({"_id": "admins"})
     return user_id in data["users"]
 
-# === BOT ===
+# Track running downloads
+active_downloads = {}
+
 app = Client(
     "torrent_bot",
     api_id=API_ID,
@@ -49,14 +48,12 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# Regex helpers
 def is_magnet_link(text: str) -> bool:
     return text.startswith("magnet:?")
 
 def is_torrent_url(text: str) -> bool:
     return re.match(r'^https?://.*\.torrent($|\?)', text)
 
-# /start
 @app.on_message(filters.command("start"))
 async def start(client, message: Message):
     await message.reply_text(
@@ -65,19 +62,30 @@ async def start(client, message: Message):
         "Use /help for commands."
     )
 
-# /help
 @app.on_message(filters.command("help"))
 async def help_cmd(client, message: Message):
     await message.reply_text(
         "**ℹ️ Help Menu**\n\n"
         "/start - Greet the bot\n"
-        "/help - Show help\n"
+        "/help - Show this help\n"
         "/in <magnet/torrent-url> - Start a torrent download\n"
+        "/cancel - Cancel your current download\n"
         "Or send .torrent file directly.\n"
         "Only admins can trigger downloads."
     )
 
-# /in command
+@app.on_message(filters.command("cancel"))
+async def cancel_cmd(client, message: Message):
+    user_id = message.from_user.id
+    proc = active_downloads.get(user_id)
+
+    if proc:
+        proc.kill()
+        active_downloads.pop(user_id, None)
+        await message.reply_text("✅ Download cancelled.")
+    else:
+        await message.reply_text("ℹ️ No active download to cancel.")
+
 @app.on_message(filters.command("in"))
 async def in_cmd(client, message: Message):
     user_id = message.from_user.id
@@ -98,39 +106,50 @@ async def in_cmd(client, message: Message):
 
     progress_msg = await message.reply_text("Downloading 🔥❄️")
 
+    # Prepare aria2c process
     proc = await asyncio.create_subprocess_exec(
         ARIA2C_PATH,
+        "--bt-stop-timeout=10",
         "-d", DOWNLOAD_PATH,
         link,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
 
+    active_downloads[user_id] = proc
+
     last_progress = ""
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            break
+    try:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
 
-        text_line = line.decode("utf-8").strip()
-        match = re.search(r'(\d+)%', text_line)
-        if match:
-            percent = match.group(1)
-            if percent != last_progress:
-                last_progress = percent
-                try:
-                    await progress_msg.edit(
-                        f"Downloading 🔥❄️\nProgress: {percent}%"
-                    )
-                except Exception:
-                    pass
+            text_line = line.decode("utf-8").strip()
+            match = re.search(r'(\d+)%', text_line)
+            if match:
+                percent = match.group(1)
+                if percent != last_progress:
+                    last_progress = percent
+                    try:
+                        await progress_msg.edit(
+                            f"Downloading 🔥❄️\nProgress: {percent}%"
+                        )
+                    except Exception:
+                        pass
 
-    await proc.wait()
+        await asyncio.wait_for(proc.wait(), timeout=300)
 
-    # Check download folder
+    except asyncio.TimeoutError:
+        await progress_msg.edit("⚠️ aria2c timed out. Trying to proceed anyway.")
+        proc.kill()
+
+    finally:
+        active_downloads.pop(user_id, None)
+
     files = os.listdir(DOWNLOAD_PATH)
     if not files:
-        await progress_msg.edit("❌ Download failed.")
+        await progress_msg.edit("❌ Download failed or no files found.")
         return
 
     for fname in files:
@@ -153,10 +172,10 @@ async def in_cmd(client, message: Message):
 
     await progress_msg.delete()
 
-# Uploaded .torrent files
 @app.on_message(filters.document)
 async def handle_torrent_file(client, message: Message):
     user_id = message.from_user.id
+
     if not is_admin(user_id):
         await message.reply_text("🚫 You are not authorized to download torrents.")
         return
@@ -167,38 +186,49 @@ async def handle_torrent_file(client, message: Message):
 
     proc = await asyncio.create_subprocess_exec(
         ARIA2C_PATH,
+        "--bt-stop-timeout=10",
         "-d", DOWNLOAD_PATH,
         file_path,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
 
+    active_downloads[user_id] = proc
+
     last_progress = ""
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            break
+    try:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
 
-        text_line = line.decode("utf-8").strip()
-        match = re.search(r'(\d+)%', text_line)
-        if match:
-            percent = match.group(1)
-            if percent != last_progress:
-                last_progress = percent
-                try:
-                    await progress_msg.edit(
-                        f"Downloading 🔥❄️\nProgress: {percent}%"
-                    )
-                except Exception:
-                    pass
+            text_line = line.decode("utf-8").strip()
+            match = re.search(r'(\d+)%', text_line)
+            if match:
+                percent = match.group(1)
+                if percent != last_progress:
+                    last_progress = percent
+                    try:
+                        await progress_msg.edit(
+                            f"Downloading 🔥❄️\nProgress: {percent}%"
+                        )
+                    except Exception:
+                        pass
 
-    await proc.wait()
+        await asyncio.wait_for(proc.wait(), timeout=300)
+
+    except asyncio.TimeoutError:
+        await progress_msg.edit("⚠️ aria2c timed out. Trying to proceed anyway.")
+        proc.kill()
+
+    finally:
+        active_downloads.pop(user_id, None)
 
     os.remove(file_path)
 
     files = os.listdir(DOWNLOAD_PATH)
     if not files:
-        await progress_msg.edit("❌ Download failed.")
+        await progress_msg.edit("❌ Download failed or no files found.")
         return
 
     for fname in files:
